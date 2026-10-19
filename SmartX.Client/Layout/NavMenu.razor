@@ -1,0 +1,36 @@
+﻿@inject NavigationManager Nav
+
+<nav class="sidebar">
+    <div class="brand">
+        <div class="brand-name">Smart-X</div>
+        <div class="brand-sub">Ingestion Gateway</div>
+    </div>
+
+    <div class="nav-list">
+        @* Pillar one — implemented in this part. *@
+        <NavLink class="nav-item" href="" Match="NavLinkMatch.All">
+            <span>Sensor Data Ingestion</span>
+        </NavLink>
+
+        <NavLink class="nav-item" href="devices">
+            <span>Sensor Registry</span>
+        </NavLink>
+
+        <NavLink class="nav-item" href="diagnostics">
+            <span>Pipeline Diagnostics</span>
+        </NavLink>
+
+        @* Pillars two and three are deliberately visible but disabled, so the
+           architecture is legible from the first screen rather than appearing
+           later without context. *@
+        <div class="nav-item disabled" title="Planned for Part 2">
+            <span>Command Stream</span>
+            <span class="nav-badge">Part 2</span>
+        </div>
+
+        <div class="nav-item disabled" title="Planned for the final PoE">
+            <span>Mesh Topology</span>
+            <span class="nav-badge">PoE</span>
+        </div>
+    </div>
+</nav>
