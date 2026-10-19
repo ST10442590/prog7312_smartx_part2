@@ -5,14 +5,13 @@ namespace SmartX.Shared.Telemetry;
 
 // Maintains one device's rolling baseline and converts its latest reading
 // into the severity score the Pulse Grid renders as colour.
-// <remarks>
-// Scoring is per device, not global. A greenhouse humidity sensor sitting
-// at 85% and a server-room sensor sitting at 30% are both perfectly normal
-// for where they are, so a single global threshold would either spam false
+//
+// Scoring is per device, not global. A greenhouse humidity sensor sitting at
+// 85% and a server-room sensor sitting at 30% are both perfectly normal for
+// where they are, so a single global threshold would either spam false
 // alarms or miss real ones. A z-score — how many standard deviations the
-// current reading sits from this node's own recent mean — puts every
-// channel on one comparable scale.
-// </remarks>
+// current reading sits from this node's own recent mean — puts every channel
+// on one comparable scale.
 public sealed class SensorHealthWindow
 {
     // Below this, the node is behaving normally.
@@ -76,9 +75,9 @@ public sealed class SensorHealthWindow
     }
 
     // Sample standard deviation of the current window, using the two-pass
-    // method. The window is small and bounded, so the second pass is
-    // cheap and avoids the cancellation error the naive
-    // sum-of-squares shortcut suffers from.
+    // method. The window is small and bounded, so the second pass is cheap
+    // and avoids the cancellation error the naive sum-of-squares shortcut
+    // suffers from.
     public double StandardDeviation()
     {
         if (_window.Count < 2) return 0d;
@@ -93,9 +92,9 @@ public sealed class SensorHealthWindow
         return Math.Sqrt(sumSquares / (_window.Count - 1));
     }
 
-    // How many standard deviations <paramref name="value"/> sits from the
-    // window mean. Returns 0 while the baseline is still filling, so a node
-    // that has only just come online does not alarm on its first packet.
+    // How many standard deviations the value sits from the window mean.
+    // Returns 0 while the baseline is still filling, so a node that has only
+    // just come online does not alarm on its first packet.
     public double ZScoreFor(double value)
     {
         if (_window.Count < 4) return 0d;
@@ -135,7 +134,20 @@ public sealed class SensorHealthWindow
     }
 
     // The window contents, oldest-first, for the tile sparkline.
-    public double[] Sparkline() => _window.ToArray();
+    //
+    // Rounded because the sparkline is only ever drawn as a line, never read
+    // as numbers. Full float-widening precision would add roughly ten
+    // characters per value to every tile on every poll, for no visible
+    // difference.
+    public double[] Sparkline()
+    {
+        var values = _window.ToArray();
+        for (var i = 0; i < values.Length; i++)
+        {
+            values[i] = Math.Round(values[i], 3);
+        }
+        return values;
+    }
 
     public void Reset()
     {
