@@ -37,10 +37,15 @@ public sealed class MeshSimulator : BackgroundService
     private static readonly TimeSpan AttentionLifetime = TimeSpan.FromMinutes(5);
 
     // Chance per node per round of an injected anomalous spike.
-    private const double SpikeChance = 0.004;
+    //
+    // Tuned so the mesh sits mostly nominal with occasional faults. Higher
+    // values prove the detection works but leave the grid permanently
+    // coloured, which defeats the point: if everything is amber, amber stops
+    // carrying information.
+    private const double SpikeChance = 0.0015;
 
     // Chance per node per round of the node going silent.
-    private const double DropoutChance = 0.002;
+    private const double DropoutChance = 0.0006;
 
     private DateTimeOffset _lastAttentionExpiry = DateTimeOffset.UtcNow;
 
@@ -338,8 +343,8 @@ public sealed class MeshSimulator : BackgroundService
         });
 
         // Only record it if it was actually queued, so a suppressed
-        // duplicate neither inflates the graph nor pollutes the model with
-        // a situation the operator never actually saw.
+        // duplicate neither inflates the graph nor pollutes the model with a
+        // situation the operator never actually saw.
         if (queued)
         {
             _index.RecordAlert(DateTimeOffset.UtcNow);
