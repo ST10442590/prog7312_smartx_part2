@@ -539,6 +539,11 @@ button, .btn {
         color: var(--text-dim);
     }
 
+    button.small {
+        padding: 0.3rem 0.6rem;
+        font-size: 0.75rem;
+    }
+
 /* ------------------------------------------------------------ alerts */
 .alert {
     padding: 0.7rem 0.9rem;
@@ -627,6 +632,226 @@ tr:hover td {
         padding: 1rem;
     }
 }
+
+/* ==========================================================================
+   Command stream — Part 2
+   ========================================================================== */
+
+.two-col {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: 1rem;
+    align-items: start;
+}
+
+@media (max-width: 1100px) {
+    .two-col {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Queue depth bars. The width is the depth, so a backlog is visible as
+   length rather than having to be read as a number. */
+.depth-bar {
+    height: 6px;
+    background: var(--bg);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 0.4rem;
+}
+
+.depth-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+
+    .depth-fill.standard {
+        background: var(--accent);
+    }
+
+    .depth-fill.priority {
+        background: var(--spike);
+    }
+
+    .depth-fill.undo {
+        background: var(--drift);
+    }
+
+/* Alert rows, ordered by the priority queue. */
+.alert-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.5rem 0.6rem;
+    border-left: 3px solid var(--border-strong);
+    background: var(--bg);
+    border-radius: var(--radius-sm);
+    margin-bottom: 0.4rem;
+    font-size: 0.82rem;
+}
+
+    .alert-row.critical {
+        border-left-color: var(--spike);
+        background: var(--spike-bg);
+    }
+
+    .alert-row.high {
+        border-left-color: var(--drift);
+        background: var(--drift-bg);
+    }
+
+    .alert-row.elevated {
+        border-left-color: var(--accent);
+    }
+
+.alert-sev {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+    min-width: 72px;
+}
+
+.alert-row.critical .alert-sev {
+    color: var(--spike);
+}
+
+.alert-row.high .alert-sev {
+    color: var(--drift);
+}
+
+.alert-row.elevated .alert-sev {
+    color: var(--accent);
+}
+
+/* Suggested actions. Left border colour encodes why it was suggested. */
+.suggestion {
+    padding: 0.7rem 0.8rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    margin-bottom: 0.6rem;
+}
+
+    .suggestion.learned {
+        border-left-color: #8b7ff0;
+    }
+
+    .suggestion.anomaly {
+        border-left-color: var(--drift);
+    }
+
+.suggestion-title {
+    font-weight: 600;
+    font-size: 0.88rem;
+    margin-bottom: 0.2rem;
+}
+
+.suggestion-why {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    line-height: 1.45;
+}
+
+.suggestion-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    font-size: 0.7rem;
+    color: var(--text-faint);
+}
+
+.chip {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    border: 1px solid var(--border-strong);
+    border-radius: 3px;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+    .chip.learned {
+        color: #a99bff;
+        border-color: #574b9e;
+    }
+
+    .chip.anomaly {
+        color: var(--drift);
+        border-color: #6b5518;
+    }
+
+/* Command history, newest at the top — the order the stack unwinds. */
+.stack-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.45rem 0.6rem;
+    background: var(--bg);
+    border-radius: var(--radius-sm);
+    margin-bottom: 0.35rem;
+    font-size: 0.8rem;
+}
+
+    .stack-row.top {
+        border: 1px solid var(--drift);
+        background: var(--drift-bg);
+    }
+
+.stack-label {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-faint);
+}
+
+/* Packets coming off the FIFO queue. */
+.fifo-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.3rem 0.5rem;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+}
+
+.fifo-seq {
+    color: var(--text-faint);
+    min-width: 58px;
+}
+
+.search-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    margin-bottom: 0.75rem;
+}
+
+    .search-row .field {
+        margin-bottom: 0;
+        flex: 1 1 200px;
+    }
+
+.device-hit {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.83rem;
+}
+
+    .device-hit:hover {
+        background: var(--surface-raised);
+    }
 
 /* ==========================================================================
    Framework UI — Blazor's error bar and startup loader.

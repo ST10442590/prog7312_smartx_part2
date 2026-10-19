@@ -1,0 +1,558 @@
+﻿@page "/stream"
+@implements IDisposable
+@inject SmartXApiClient Api
+
+<PageTitle>Smart-X — Real-Time Command Stream</PageTitle>
+
+<div class="page-head">
+    <div>
+        <h1>Real-Time Command Stream and History</h1>
+        <p class="page-sub">
+            Live processing queues, manual device overrides with undo, and
+            proactive suggestions learned from operator behaviour.
+        </p>
+    </div>
+
+    <span class="link-state">
+        <span class="link-dot @(_online ? "online" : "")"></span>
+        @(_online ? "Gateway online" : "Gateway unreachable")
+    </span>
+</div>
+
+@if (!_online && _loaded)
+{
+    <div class="alert bad">
+        The gateway is not responding. Start the API with
+        <code>dotnet run --project SmartX.Api</code> and this view will
+        reconnect on its own.
+    </div>
+}
+
+@* -------------------------------------------------- structure depths *@
+<div class="stat-row">
+    <div class="stat">
+        <div class="stat-label">FIFO queue</div>
+        <div class="stat-value">@(_snapshot?.StandardQueueDepth ?? 0)</div>
+        <div class="depth-bar">
+            <div class="depth-fill standard" style="width:@DepthWidth(_snapshot?.StandardQueueDepth ?? 0, 60)%"></div>
+        </div>
+    </div>
+    <div class="stat is-spike">
+        <div class="stat-label">Priority queue</div>
+        <div class="stat-value">@(_snapshot?.AlertQueueDepth ?? 0)</div>
+        <div class="depth-bar">
+            <div class="depth-fill priority" style="width:@DepthWidth(_snapshot?.AlertQueueDepth ?? 0, 10)%"></div>
+        </div>
+    </div>
+    <div class="stat is-drift">
+        <div class="stat-label">Undo stack</div>
+        <div class="stat-value">@(_snapshot?.UndoDepth ?? 0)</div>
+        <div class="depth-bar">
+            <div class="depth-fill undo" style="width:@DepthWidth(_snapshot?.UndoDepth ?? 0, 10)%"></div>
+        </div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Active alerts (set)</div>
+        <div class="stat-value">@(_snapshot?.ActiveAlertCount ?? 0)</div>
+    </div>
+    <div class="stat is-nominal">
+        <div class="stat-label">Duplicates blocked</div>
+        <div class="stat-value">@(_snapshot?.DuplicatesSuppressed ?? 0)</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Processed</div>
+        <div class="stat-value">@(_snapshot?.PacketsProcessed.ToString("N0") ?? "0")</div>
+    </div>
+</div>
+
+<div class="two-col">
+    <div>
+        @* ------------------------------------------- priority queue *@
+        <div class="card">
+            <h2>Alert queue — priority order</h2>
+            <p class="page-sub">
+                Critical alerts bypass the standard FIFO stream entirely.
+                The queue releases by severity, not by arrival time, so a
+                power spike is handled ahead of routine traffic already
+                waiting.
+            </p>
+
+            @if (_snapshot?.PendingAlerts is { Count: > 0 } alerts)
+            {
+                @foreach (var alert in alerts)
+                {
+                    <div class="alert-row @SeverityClass(alert.Severity)">
+                        <span class="alert-sev">@alert.Severity</span>
+                        <span><strong>@alert.DeviceName</strong> — @alert.Message</span>
+                    </div>
+                }
+            }
+            else
+            {
+                <div class="empty">
+                    Queue empty — alerts are drained every processing tick.
+                    Inject one below to see the ordering.
+                </div>
+            }
+
+            <div class="search-row" style="margin-top:1rem;">
+                <div class="field">
+                    <label for="alert-device">Device</label>
+                    <select id="alert-device" @bind="_alertDeviceId">
+                        @foreach (var profile in _profiles)
+                        {
+                            <option value="@profile.Id">@profile.DisplayName</option>
+                        }
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="alert-sev">Severity</label>
+                    <select id="alert-sev" @bind="_alertSeverity">
+                        @foreach (var severity in Enum.GetValues<AlertSeverity>())
+                        {
+                            <option value="@severity">@severity</option>
+                        }
+                    </select>
+                </div>
+                <button @onclick="InjectAlertAsync" disabled="@_busy">Inject alert</button>
+            </div>
+
+            @if (_alertResult is not null)
+            {
+                <div class="alert @(_alertResult.Queued ? "ok" : "bad")">
+                    @if (_alertResult.Queued)
+                    {
+                        <span>Alert queued. It will be released ahead of lower severities.</span>
+                    }
+                    else
+                    {
+                        <span>
+                            Suppressed as a duplicate — this exact condition is
+                            already active for this device. That is the HashSet
+                            preventing repeat alerts for an ongoing fault.
+                        </span>
+                    }
+                </div>
+            }
+        </div>
+
+        @* ------------------------------------------------ FIFO queue *@
+        <div class="card">
+            <h2>Standard stream — FIFO order</h2>
+            <p class="page-sub">
+                Telemetry is processed first-in-first-out. Sequence numbers
+                descend here because the newest is shown at the top, but the
+                queue released them in ascending order.
+            </p>
+
+            @if (_snapshot?.RecentlyProcessed is { Count: > 0 } processed)
+            {
+                @foreach (var packet in processed)
+                {
+                    <div class="fifo-row">
+                        <span class="fifo-seq">#@packet.Sequence</span>
+                        <span style="min-width:110px;">@packet.DeviceName</span>
+                        <span>@packet.Value</span>
+                        <span style="margin-left:auto;">@packet.ProcessedUtc.ToString("HH:mm:ss.fff")</span>
+                    </div>
+                }
+            }
+            else
+            {
+                <div class="empty">Nothing processed yet.</div>
+            }
+        </div>
+
+        @* ----------------------------------------------- device search *@
+        <div class="card">
+            <h2>Find a device</h2>
+            <p class="page-sub">
+                Search by name, MAC, zone or category. Every search is also a
+                signal: the engine learns what you look for next.
+            </p>
+
+            <div class="search-row">
+                <div class="field">
+                    <label for="q">Search</label>
+                    <input id="q" @bind="_query" @bind:event="oninput"
+                           @onkeydown="OnSearchKey"
+                           placeholder="ESP32-A00, Zone 1, PowerConsumption…" />
+                </div>
+                <button @onclick="SearchAsync" disabled="@_busy">Search</button>
+                <button class="ghost" @onclick="ClearSearch">Clear</button>
+            </div>
+
+            @if (_searchResult is not null)
+            {
+                <p class="page-sub">
+                    @_searchResult.Count match(es) for "@_searchResult.Query"
+                </p>
+
+                @foreach (var device in _searchResult.Devices)
+                {
+                    <div class="device-hit">
+                        <span>
+                            <strong>@device.DisplayName</strong>
+                            <span class="mono" style="color:var(--text-faint);">
+                                &nbsp;@device.MacAddress
+                            </span>
+                        </span>
+                        <span style="color:var(--text-faint);">
+                            @device.Category — @device.LocationPath
+                        </span>
+                    </div>
+                }
+            }
+        </div>
+
+        @* ------------------------------------------- manual overrides *@
+        <div class="card">
+            <h2>Manual override</h2>
+            <p class="page-sub">
+                Commands are pushed onto a stack as they are issued, so undo
+                walks back through history one step at a time — last in,
+                first out.
+            </p>
+
+            <div class="search-row">
+                <div class="field">
+                    <label for="cmd-device">Device</label>
+                    <select id="cmd-device" @bind="_commandDeviceId">
+                        @foreach (var profile in _profiles)
+                        {
+                            <option value="@profile.Id">@profile.DisplayName</option>
+                        }
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="cmd-kind">Command</label>
+                    <select id="cmd-kind" @bind="_commandKind">
+                        @foreach (var kind in Enum.GetValues<CommandKind>())
+                        {
+                            <option value="@kind">@kind</option>
+                        }
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="cmd-state">New state</label>
+                    <select id="cmd-state" @bind="_commandState">
+                        <option value="true">On</option>
+                        <option value="false">Off</option>
+                    </select>
+                </div>
+                <button @onclick="IssueAsync" disabled="@_busy">Send command</button>
+                <button class="ghost" @onclick="UndoAsync"
+                        disabled="@(_busy || (_snapshot?.UndoDepth ?? 0) == 0)">
+                    Undo last
+                </button>
+            </div>
+
+            @if (_commandResult is not null)
+            {
+                <div class="alert @(_commandResult.Succeeded ? "ok" : "bad")">
+                    @(_commandResult.Succeeded
+                        ? _commandResult.Command?.Describe() ?? "Command applied."
+                        : _commandResult.Error)
+                </div>
+            }
+
+            @if (_snapshot?.UndoHistory is { Count: > 0 } history)
+            {
+                <div class="stack-label">Command stack — top first</div>
+                @for (var i = 0; i < history.Count; i++)
+                {
+                    var command = history[i];
+                    <div class="stack-row @(i == 0 ? "top" : "")">
+                        <span>
+                            @if (i == 0)
+                            {
+                                <span class="stack-label">next undo&nbsp;&nbsp;</span>
+                            }
+                            @command.Describe()
+                        </span>
+                        <span style="color:var(--text-faint);">
+                            @command.IssuedUtc.ToString("HH:mm:ss")
+                        </span>
+                    </div>
+                }
+            }
+            else
+            {
+                <div class="empty">No commands issued yet.</div>
+            }
+        </div>
+    </div>
+
+    @* ----------------------------------------------- suggestions rail *@
+    <div>
+        <div class="card">
+            <h2>Suggested actions</h2>
+            <p class="page-sub">
+                Learned from what you do, and from what the mesh is doing
+                that you have not looked at yet.
+            </p>
+
+            @if (_suggestions?.Suggestions is { Count: > 0 } items)
+            {
+                @foreach (var suggestion in items)
+                {
+                    <div class="suggestion @BasisClass(suggestion.Basis)">
+                        <div class="suggestion-title">@suggestion.Title</div>
+                        <div class="suggestion-why">@suggestion.Rationale</div>
+                        <div class="suggestion-meta">
+                            <span class="chip @BasisClass(suggestion.Basis)">
+                                @BasisLabel(suggestion.Basis)
+                            </span>
+                            <span>@((suggestion.Confidence * 100).ToString("0"))% confidence</span>
+                            <button class="ghost small" style="margin-left:auto;"
+                                    @onclick="() => DismissAsync(suggestion.DeviceId)">
+                                Dismiss
+                            </button>
+                        </div>
+                    </div>
+                }
+            }
+            else
+            {
+                <div class="empty">
+                    Nothing to suggest. Search a few devices in sequence and
+                    the engine will start predicting.
+                </div>
+            }
+        </div>
+
+        <div class="card">
+            <h2>Learned model</h2>
+            <p class="page-sub">
+                @(_suggestions?.EventsObserved ?? 0) events observed,
+                @(_suggestions?.DistinctSituations ?? 0) distinct situations,
+                @(_suggestions?.TransitionsLearned ?? 0) transitions learned.
+            </p>
+
+            @if (_suggestions?.TopTransitions is { Count: > 0 } transitions)
+            {
+                <table>
+                    <thead>
+                        <tr><th>When</th><th>You then</th><th>Seen</th><th>P</th></tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var transition in transitions)
+                        {
+                            <tr>
+                                <td class="mono">@Shorten(transition.From)</td>
+                                <td class="mono">@Shorten(transition.To)</td>
+                                <td>@transition.Count</td>
+                                <td>@transition.Probability</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+            else
+            {
+                <div class="empty">No transitions learned yet.</div>
+            }
+        </div>
+
+        <div class="card">
+            <h2>Recent activity</h2>
+            @if (_suggestions?.RecentActivity is { Count: > 0 } activity)
+            {
+                @foreach (var evt in activity)
+                {
+                    <div class="fifo-row">
+                        <span style="min-width:120px;">@evt.Describe()</span>
+                        <span style="margin-left:auto;">
+                            @evt.OccurredUtc.ToString("HH:mm:ss")
+                        </span>
+                    </div>
+                }
+            }
+            else
+            {
+                <div class="empty">No activity recorded.</div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private List<SensorProfile> _profiles = [];
+    private StreamSnapshotDto? _snapshot;
+    private SuggestionReportDto? _suggestions;
+    private CommandResultDto? _commandResult;
+    private AlertTestResultDto? _alertResult;
+    private DeviceSearchResultDto? _searchResult;
+
+    private string _query = string.Empty;
+    private string _alertDeviceId = string.Empty;
+    private string _commandDeviceId = string.Empty;
+    private AlertSeverity _alertSeverity = AlertSeverity.Critical;
+    private CommandKind _commandKind = CommandKind.TogglePump;
+    private bool _commandState = true;
+
+    private bool _online;
+    private bool _loaded;
+    private bool _busy;
+
+    private CancellationTokenSource? _cts;
+    private PeriodicTimer? _timer;
+
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(1200);
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+
+        var profiles = await Api.GetDevicesAsync();
+        _profiles = profiles.OrderBy(p => p.DisplayName).ToList();
+
+        _alertDeviceId = _profiles.FirstOrDefault()?.Id ?? string.Empty;
+        _commandDeviceId = _profiles
+            .FirstOrDefault(p => p.Category == SensorCategory.Actuator)?.Id
+            ?? _profiles.FirstOrDefault()?.Id
+            ?? string.Empty;
+
+        await RefreshAsync();
+        _loaded = true;
+
+        _timer = new PeriodicTimer(PollInterval);
+        _ = PollLoopAsync(_cts.Token);
+    }
+
+    private async Task PollLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (_timer is not null && await _timer.WaitForNextTickAsync(ct))
+            {
+                await RefreshAsync();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+        {
+            // Component disposed mid-poll during navigation. Expected.
+        }
+    }
+
+    private async Task RefreshAsync()
+    {
+        var ct = _cts?.Token ?? CancellationToken.None;
+
+        var snapshot = await Api.GetStreamSnapshotAsync(ct);
+        _online = snapshot is not null;
+        _snapshot = snapshot ?? _snapshot;
+
+        _suggestions = await Api.GetSuggestionsAsync(ct) ?? _suggestions;
+    }
+
+    private async Task InjectAlertAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_alertDeviceId)) return;
+
+        _busy = true;
+        _alertResult = await Api.SimulateAlertAsync(_alertDeviceId, _alertSeverity);
+        _snapshot = _alertResult?.Snapshot ?? _snapshot;
+        _busy = false;
+    }
+
+    private async Task IssueAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_commandDeviceId)) return;
+
+        _busy = true;
+        _commandResult = await Api.IssueCommandAsync(new IssueCommandDto
+        {
+            DeviceId = _commandDeviceId,
+            Kind = _commandKind,
+            NewState = _commandState
+        });
+
+        _snapshot = _commandResult?.Snapshot ?? _snapshot;
+        _busy = false;
+    }
+
+    private async Task UndoAsync()
+    {
+        _busy = true;
+        _commandResult = await Api.UndoCommandAsync();
+        _snapshot = _commandResult?.Snapshot ?? _snapshot;
+        _busy = false;
+    }
+
+    private async Task SearchAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_query)) return;
+
+        _busy = true;
+        _searchResult = await Api.SearchDevicesAsync(_query);
+        _busy = false;
+
+        // Refresh immediately so the suggestion that this search unlocked
+        // appears without waiting for the next poll.
+        await RefreshAsync();
+    }
+
+    private async Task OnSearchKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await SearchAsync();
+    }
+
+    private void ClearSearch()
+    {
+        _query = string.Empty;
+        _searchResult = null;
+    }
+
+    private async Task DismissAsync(string deviceId)
+    {
+        await Api.MarkAttendedAsync(deviceId);
+        await RefreshAsync();
+    }
+
+    // Depth as a percentage of an expected maximum, capped at 100 so a
+    // large backlog does not overflow the bar.
+    private static int DepthWidth(int depth, int expectedMax) =>
+        expectedMax <= 0 ? 0 : Math.Min(100, depth * 100 / expectedMax);
+
+    private static string SeverityClass(AlertSeverity severity) => severity switch
+    {
+        AlertSeverity.Critical => "critical",
+        AlertSeverity.High => "high",
+        AlertSeverity.Elevated => "elevated",
+        _ => ""
+    };
+
+    private static string BasisClass(SuggestionBasis basis) => basis switch
+    {
+        SuggestionBasis.LearnedTransition => "learned",
+        SuggestionBasis.UnattendedAnomaly => "anomaly",
+        _ => ""
+    };
+
+    private static string BasisLabel(SuggestionBasis basis) => basis switch
+    {
+        SuggestionBasis.LearnedTransition => "learned",
+        SuggestionBasis.UnattendedAnomaly => "proactive",
+        _ => "pattern"
+    };
+
+    // Turns "Search:ESP32-A00" into "search A00" for the model table.
+    private static string Shorten(string key)
+    {
+        var parts = key.Split(':');
+        if (parts.Length < 2) return key;
+
+        var kind = parts[0].ToLowerInvariant();
+        var subject = parts[1].Replace("ESP32-", "");
+        return parts.Length > 2 ? $"{kind} {subject} ({parts[2]})" : $"{kind} {subject}";
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _timer?.Dispose();
+        _cts?.Dispose();
+    }
+}

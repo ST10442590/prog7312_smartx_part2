@@ -7,7 +7,7 @@
     </div>
 
     <div class="nav-list">
-        @* Pillar one — implemented in this part. *@
+        @* Pillar one — Part 1. *@
         <NavLink class="nav-item" href="" Match="NavLinkMatch.All">
             <span>Sensor Data Ingestion</span>
         </NavLink>
@@ -20,14 +20,13 @@
             <span>Pipeline Diagnostics</span>
         </NavLink>
 
-        @* Pillars two and three are deliberately visible but disabled, so the
-           architecture is legible from the first screen rather than appearing
-           later without context. *@
-        <div class="nav-item disabled" title="Planned for Part 2">
+        @* Pillar two — Part 2. *@
+        <NavLink class="nav-item" href="stream">
             <span>Command Stream</span>
-            <span class="nav-badge">Part 2</span>
-        </div>
+        </NavLink>
 
+        @* Pillar three remains disabled until the final PoE, so the
+           architecture is legible from the first screen. *@
         <div class="nav-item disabled" title="Planned for the final PoE">
             <span>Mesh Topology</span>
             <span class="nav-badge">PoE</span>

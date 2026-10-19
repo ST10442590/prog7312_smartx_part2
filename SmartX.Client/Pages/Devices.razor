@@ -1,0 +1,297 @@
+﻿@page "/devices"
+@inject SmartXApiClient Api
+
+<PageTitle>Smart-X — Sensor Registry</PageTitle>
+
+<div class="page-head">
+    <div>
+        <h1>Sensor Registry</h1>
+        <p class="page-sub">
+            Register a node against its deployment ancestry, then attach its
+            configuration files, deployment photos or hardware logs.
+        </p>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Register a sensor</h2>
+
+    @if (_result is not null)
+    {
+        <div class="alert @(_result.Succeeded ? "ok" : "bad")">
+            @if (_result.Succeeded)
+            {
+                <span>Registered @_lastRegisteredName successfully.</span>
+            }
+            else
+            {
+                <span>Registration rejected:</span>
+                <ul>
+                    @foreach (var error in _result.Errors)
+                    {
+                        <li>@error</li>
+                    }
+                </ul>
+            }
+        </div>
+    }
+
+    <div class="form-grid">
+        <div class="field">
+            <label for="mac">MAC address / unique identifier</label>
+            <input id="mac" @bind="_draft.MacAddress" @bind:event="oninput"
+                   class="@(MacTouched && !SensorProfile.IsValidMac(_draft.MacAddress) ? "invalid" : "")"
+                   placeholder="AA:BB:CC:DD:EE:FF" />
+            @if (MacTouched && !SensorProfile.IsValidMac(_draft.MacAddress))
+            {
+                <div class="field-error">Must be six hex pairs separated by : or -</div>
+            }
+        </div>
+
+        <div class="field">
+            <label for="name">Display name</label>
+            <input id="name" @bind="_draft.DisplayName" @bind:event="oninput"
+                   placeholder="ESP32-Y24" />
+        </div>
+
+        <div class="field">
+            <label for="facility">Facility</label>
+            <input id="facility" @bind="_draft.Facility" placeholder="Facility A" />
+        </div>
+
+        <div class="field">
+            <label for="zone">Zone</label>
+            <input id="zone" @bind="_draft.Zone" @bind:event="oninput" placeholder="Zone 1" />
+        </div>
+
+        <div class="field">
+            <label for="subzone">Sub-zone</label>
+            <input id="subzone" @bind="_draft.SubZone" placeholder="Sub-Zone A" />
+        </div>
+
+        <div class="field">
+            <label for="node">Node id</label>
+            <input id="node" @bind="_draft.NodeId" @bind:event="oninput" placeholder="node-024" />
+        </div>
+
+        <div class="field">
+            <label for="category">Category</label>
+            <select id="category" @bind="_draft.Category">
+                @foreach (var category in Enum.GetValues<SensorCategory>())
+                {
+                    <option value="@category">@category</option>
+                }
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="unit">Unit</label>
+            <select id="unit" @bind="_draft.Unit">
+                @foreach (var unit in Enum.GetValues<TelemetryUnit>())
+                {
+                    <option value="@unit">@unit</option>
+                }
+            </select>
+            <div class="field-hint">
+                Actuators report Boolean; power sensors report Watt or kWh.
+            </div>
+        </div>
+    </div>
+
+    @* Validation runs as the operator types, using the same method the API
+       runs server-side, so the two can never disagree. *@
+    @if (_liveErrors.Count > 0)
+    {
+        <div class="alert bad">
+            <ul>
+                @foreach (var error in _liveErrors)
+                {
+                    <li>@error</li>
+                }
+            </ul>
+        </div>
+    }
+
+    <button @onclick="RegisterAsync" disabled="@(_busy || _liveErrors.Count > 0)">
+        @(_busy ? "Registering…" : "Register sensor")
+    </button>
+</div>
+
+<div class="card">
+    <div class="page-head" style="margin-bottom:0.75rem;">
+        <h2>Attach a configuration file or log</h2>
+    </div>
+
+    @if (_uploadResult is not null)
+    {
+        <div class="alert @(_uploadResult.Succeeded ? "ok" : "bad")">
+            @if (_uploadResult.Succeeded)
+            {
+                <span>Uploaded @_lastUploadName.</span>
+            }
+            else
+            {
+                <ul>
+                    @foreach (var error in _uploadResult.Errors)
+                    {
+                        <li>@error</li>
+                    }
+                </ul>
+            }
+        </div>
+    }
+
+    <div class="form-grid">
+        <div class="field">
+            <label for="target">Sensor</label>
+            <select id="target" @bind="_uploadTargetId">
+                <option value="">Select a device…</option>
+                @foreach (var profile in _profiles)
+                {
+                    <option value="@profile.Id">@profile.DisplayName — @profile.LocationPath</option>
+                }
+            </select>
+        </div>
+
+        <div class="field">
+            <label for="file">File</label>
+            <InputFile id="file" OnChange="OnFileSelected" />
+            <div class="field-hint">
+                Config, log, CSV or image. 25 MB maximum.
+            </div>
+        </div>
+    </div>
+
+    @if (_uploading)
+    {
+        <p class="page-sub">Uploading @_lastUploadName…</p>
+    }
+</div>
+
+<div class="card">
+    <h2>Registered devices (@_profiles.Count)</h2>
+
+    @if (_profiles.Count == 0)
+    {
+        <div class="empty">Nothing registered yet.</div>
+    }
+    else
+    {
+        <table>
+            <thead>
+                <tr>
+                    <th>Device</th>
+                    <th>MAC</th>
+                    <th>Location</th>
+                    <th>Category</th>
+                    <th>Unit</th>
+                    <th>Files</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var profile in _profiles)
+                {
+                    <tr>
+                        <td>@profile.DisplayName</td>
+                        <td class="mono">@profile.MacAddress</td>
+                        <td>@profile.LocationPath</td>
+                        <td>@profile.Category</td>
+                        <td>@profile.Unit</td>
+                        <td>@profile.Attachments.Count</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</div>
+
+@code {
+    private SensorProfile _draft = NewDraft();
+    private List<SensorProfile> _profiles = [];
+
+    private ApiResult? _result;
+    private ApiResult? _uploadResult;
+
+    private string _uploadTargetId = string.Empty;
+    private string _lastRegisteredName = string.Empty;
+    private string _lastUploadName = string.Empty;
+
+    private bool _busy;
+    private bool _uploading;
+
+    // 25 MB, matching the limit the API enforces.
+    private const long MaxUploadBytes = 25L * 1024 * 1024;
+
+    private bool MacTouched => !string.IsNullOrEmpty(_draft.MacAddress);
+
+    // Runs the shared validation on every render, so the button stays
+    // disabled until the profile would actually be accepted.
+    private IReadOnlyList<string> _liveErrors => _draft.Validate();
+
+    protected override async Task OnInitializedAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        var profiles = await Api.GetDevicesAsync();
+        _profiles = profiles.OrderBy(p => p.DisplayName).ToList();
+    }
+
+    private static SensorProfile NewDraft() => new()
+    {
+        Facility = "Facility A",
+        Zone = "Zone 1",
+        SubZone = "Sub-Zone A",
+        Category = SensorCategory.Environmental,
+        Unit = TelemetryUnit.Celsius
+    };
+
+    private async Task RegisterAsync()
+    {
+        _busy = true;
+        _result = null;
+
+        _lastRegisteredName = _draft.DisplayName;
+        _result = await Api.RegisterDeviceAsync(_draft);
+
+        if (_result.Succeeded)
+        {
+            _draft = NewDraft();
+            await LoadAsync();
+        }
+
+        _busy = false;
+    }
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        _uploadResult = null;
+
+        if (string.IsNullOrWhiteSpace(_uploadTargetId))
+        {
+            _uploadResult = ApiResult.Fail(["Select a device before uploading."]);
+            return;
+        }
+
+        var file = e.File;
+        _lastUploadName = file.Name;
+
+        if (file.Size > MaxUploadBytes)
+        {
+            _uploadResult = ApiResult.Fail(["That file is larger than 25 MB."]);
+            return;
+        }
+
+        _uploading = true;
+
+        // OpenReadStream caps at 512 KB by default; raise it to our own
+        // limit and stream rather than reading the file into a byte array.
+        await using var stream = file.OpenReadStream(MaxUploadBytes);
+
+        _uploadResult = await Api.UploadAttachmentAsync(
+            _uploadTargetId, stream, file.Name, file.ContentType);
+
+        _uploading = false;
+
+        if (_uploadResult.Succeeded) await LoadAsync();
+    }
+}
