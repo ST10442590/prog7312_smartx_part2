@@ -11,6 +11,7 @@ builder.Services.AddSingleton<DeviceRegistry>();
 builder.Services.AddSingleton<TelemetryArchive>();
 builder.Services.AddSingleton<CommandStreamService>();
 builder.Services.AddSingleton<DeviceIndex>();
+builder.Services.AddSingleton<SuggestionEngine>();
 builder.Services.AddScoped<TopologyBuilder>();
 builder.Services.AddHostedService<MeshSimulator>();
 
@@ -50,7 +51,6 @@ app.MapGet("/api/health", () => Results.Ok(new
 .WithSummary("Liveness probe for the gateway.");
 
 // ------------------------------------------------------------ ingestion
-// The primary receiver of telemetry. Accepts one packet from a node.
 app.MapPost("/api/telemetry", (
     TelemetryPacketDto dto,
     DeviceRegistry registry,
@@ -83,7 +83,6 @@ app.MapPost("/api/telemetry", (
 .WithName("IngestTelemetry")
 .WithSummary("Receives a single telemetry packet from a sensor node.");
 
-// Batch endpoint: a gateway forwarding a buffered window of packets.
 app.MapPost("/api/telemetry/batch", (
     TelemetryPacketDto[] packets,
     DeviceRegistry registry,
@@ -114,8 +113,6 @@ app.MapPost("/api/telemetry/batch", (
         index.Record(packet);
     }
 
-    // The whole accepted window is staged in one call, which is what the
-    // jagged buffer is designed for.
     archive.Ingest(accepted, TelemetryUnit.None);
 
     return Results.Ok(new
@@ -134,10 +131,20 @@ app.MapGet("/api/devices", (DeviceRegistry registry) =>
 .WithName("GetDevices")
 .WithSummary("Lists every registered sensor profile.");
 
-app.MapGet("/api/devices/{id}", (string id, DeviceRegistry registry) =>
+app.MapGet("/api/devices/{id}", (
+    string id, DeviceRegistry registry, SuggestionEngine engine) =>
 {
     var profile = registry.GetProfile(id);
-    return profile is null ? Results.NotFound() : Results.Ok(profile);
+    if (profile is null) return Results.NotFound();
+
+    // Opening a device is an operator action worth learning from.
+    engine.Record(new ActivityEvent
+    {
+        Kind = ActivityKind.DeviceInspect,
+        Subject = id
+    });
+
+    return Results.Ok(profile);
 })
 .WithName("GetDevice")
 .WithSummary("Returns one sensor profile.");
@@ -145,8 +152,6 @@ app.MapGet("/api/devices/{id}", (string id, DeviceRegistry registry) =>
 app.MapPost("/api/devices", (
     SensorProfile profile, DeviceRegistry registry, DeviceIndex index) =>
 {
-    // Validation runs here as well as in the browser, so the client is never
-    // the only thing standing between bad data and the mesh.
     if (!registry.TryRegister(profile, out var errors))
     {
         return Results.BadRequest(new { errors });
@@ -172,10 +177,6 @@ app.MapGet("/api/mesh/summary", (DeviceRegistry registry) =>
 .WithSummary("Mesh-wide health counters.");
 
 // ------------------------------------------------------- attachments
-// Config files, deployment photos and hardware logs, attached to a sensor
-// profile. The stream is copied straight to disk rather than buffered into
-// memory, so a large hardware log does not cost a matching allocation on
-// the gateway.
 app.MapPost("/api/devices/{id}/attachments", async (
     string id,
     IFormFile file,
@@ -258,9 +259,6 @@ app.MapGet("/api/devices/{id}/attachments", (string id, DeviceRegistry registry)
 .WithSummary("Lists files attached to a sensor profile.");
 
 // --------------------------------------------------------- topology
-// Exercises the recursive validator over the live mesh: tier ordering,
-// mains-power ancestry, cycles and depth are all checked by walking the
-// tree rather than by inspecting the flat device list.
 app.MapGet("/api/topology/validate", (TopologyBuilder topology) =>
 {
     var report = topology.Validate();
@@ -295,15 +293,11 @@ app.MapGet("/api/topology/path/{deviceId}", (
 .WithSummary("Recursively resolves a device's ancestry path.");
 
 // ------------------------------------------------------ diagnostics
-// Evidence of what the pipeline actually did: how much arrived, how much
-// is staged in the jagged buffer, how much reached the List<T> archive.
 app.MapGet("/api/diagnostics/stats", (TelemetryArchive archive) =>
     Results.Ok(archive.Stats()))
 .WithName("GetPipelineStats")
 .WithSummary("Ingestion and storage counters.");
 
-// Forces the staged jagged array to transfer into the List, so the drain
-// can be demonstrated on demand rather than waited for.
 app.MapPost("/api/diagnostics/flush", (TelemetryArchive archive) =>
 {
     var moved = archive.Flush();
@@ -344,24 +338,35 @@ app.MapGet("/api/diagnostics/benchmark", () =>
 .WithSummary("Times insertion and search against growing volumes.");
 
 // ----------------------------------------------------- command stream
-// Live depths of the FIFO queue, the priority alert queue and the undo
-// stack, plus the duplicate-suppression counter from the active-alert set.
 app.MapGet("/api/stream/snapshot", (CommandStreamService stream) =>
     Results.Ok(stream.Snapshot()))
 .WithName("GetStreamSnapshot")
 .WithSummary("Current depths and contents of the processing structures.");
 
-// Issues a manual override and pushes it onto the undo stack.
+// Issues a manual override, pushes it onto the undo stack, and records it
+// as an operator action the suggestion engine can learn from.
 app.MapPost("/api/stream/command", (
-    IssueCommandDto request, CommandStreamService stream) =>
+    IssueCommandDto request,
+    CommandStreamService stream,
+    SuggestionEngine engine) =>
 {
     var result = stream.Issue(request);
+
+    if (result.Succeeded)
+    {
+        engine.Record(new ActivityEvent
+        {
+            Kind = ActivityKind.Command,
+            Subject = request.DeviceId,
+            Detail = request.Kind.ToString()
+        });
+    }
+
     return result.Succeeded ? Results.Ok(result) : Results.BadRequest(result);
 })
 .WithName("IssueCommand")
 .WithSummary("Issues a manual override command to a device.");
 
-// Pops the most recent command and applies its inverse.
 app.MapPost("/api/stream/undo", (CommandStreamService stream) =>
 {
     var result = stream.Undo();
@@ -370,11 +375,9 @@ app.MapPost("/api/stream/undo", (CommandStreamService stream) =>
 .WithName("UndoCommand")
 .WithSummary("Reverts the most recently issued command.");
 
-// Injects a critical alert on demand, so the priority queue can be seen
-// jumping it ahead of a backlog during a demo.
 app.MapPost("/api/stream/simulate-alert", (
     string deviceId, AlertSeverity severity, DeviceRegistry registry,
-    CommandStreamService stream) =>
+    CommandStreamService stream, SuggestionEngine engine) =>
 {
     var profile = registry.GetProfile(deviceId);
     if (profile is null)
@@ -393,6 +396,16 @@ app.MapPost("/api/stream/simulate-alert", (
         Message = $"Operator-injected {severity} alert."
     });
 
+    if (queued)
+    {
+        engine.Record(new ActivityEvent
+        {
+            Kind = ActivityKind.Alert,
+            Subject = profile.Id,
+            Detail = "manual-test"
+        });
+    }
+
     // queued = false means the active-alert set suppressed it as a
     // duplicate, which is itself worth surfacing rather than hiding.
     return Results.Ok(new
@@ -406,15 +419,11 @@ app.MapPost("/api/stream/simulate-alert", (
 .WithSummary("Raises a test alert, demonstrating priority ordering and dedupe.");
 
 // ------------------------------------------------------ lookup index
-// Counters for the MAC dictionary, the category index and the sorted
-// timeline, so the structures can be seen working rather than assumed.
 app.MapGet("/api/index/stats", (DeviceIndex index) =>
     Results.Ok(index.Stats()))
 .WithName("GetIndexStats")
 .WithSummary("Lookup and timeline index counters.");
 
-// O(1) resolution of a MAC address to its device. The same question
-// answered by scanning the registry would be O(n) in the device count.
 app.MapGet("/api/index/by-mac/{mac}", (string mac, DeviceIndex index) =>
 {
     var profile = index.ByMac(mac);
@@ -425,7 +434,6 @@ app.MapGet("/api/index/by-mac/{mac}", (string mac, DeviceIndex index) =>
 .WithName("LookupByMac")
 .WithSummary("Resolves a MAC address to a device profile in constant time.");
 
-// Devices in one category, from the secondary index rather than a scan.
 app.MapGet("/api/index/by-category/{category}", (
     SensorCategory category, DeviceIndex index, DeviceRegistry registry) =>
 {
@@ -441,8 +449,6 @@ app.MapGet("/api/index/by-category/{category}", (
 .WithName("LookupByCategory")
 .WithSummary("Lists devices in a category using the secondary index.");
 
-// The timeline, already in chronological order because the structure keeps
-// it that way. Nothing is sorted at request time.
 app.MapGet("/api/index/timeline", (DeviceIndex index, int? take) =>
     Results.Ok(index.Timeline(take ?? 120)))
 .WithName("GetTimeline")
@@ -461,5 +467,75 @@ app.MapGet("/api/index/timeline/range", (
 })
 .WithName("GetTimelineRange")
 .WithSummary("Range query over the sorted timeline.");
+
+// -------------------------------------------------- suggestion engine
+// Current recommendations, plus the learned model behind them so a
+// suggestion can be traced to the observations that produced it.
+app.MapGet("/api/suggestions", (SuggestionEngine engine, int? take) =>
+    Results.Ok(engine.Report(take ?? 5)))
+.WithName("GetSuggestions")
+.WithSummary("Proactive suggested actions and the transitions behind them.");
+
+// Device search. The search itself is the signal the engine learns from —
+// what the operator looks for, and what they look for next.
+app.MapGet("/api/suggestions/search", (
+    string query,
+    DeviceRegistry registry,
+    DeviceIndex index,
+    SuggestionEngine engine) =>
+{
+    var term = query?.Trim() ?? string.Empty;
+
+    var matches = registry.AllProfiles()
+        .Where(p =>
+            p.DisplayName.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+            p.Id.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+            p.MacAddress.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+            p.LocationPath.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+            p.Category.ToString().Contains(term, StringComparison.OrdinalIgnoreCase))
+        .ToList();
+
+    // A search that resolves to exactly one device is recorded against that
+    // device, so transitions are learned per node rather than per keyword.
+    if (!string.IsNullOrWhiteSpace(term))
+    {
+        engine.Record(new ActivityEvent
+        {
+            Kind = ActivityKind.Search,
+            Subject = matches.Count == 1 ? matches[0].Id : term
+        });
+    }
+
+    return Results.Ok(new { query = term, count = matches.Count, devices = matches });
+})
+.WithName("SearchDevices")
+.WithSummary("Searches devices and records the query for pattern analysis.");
+
+// Dismisses a suggestion, so an acknowledged problem stops resurfacing.
+app.MapPost("/api/suggestions/attend/{deviceId}", (
+    string deviceId, SuggestionEngine engine) =>
+{
+    engine.MarkAttended(deviceId);
+    return Results.Ok(new { deviceId, attended = true });
+})
+.WithName("MarkAttended")
+.WithSummary("Marks a device as being dealt with.");
+
+// Clears the attention set, so unresolved problems resurface.
+app.MapPost("/api/suggestions/expire-attention", (SuggestionEngine engine) =>
+{
+    engine.ExpireAttention();
+    return Results.Ok(new { expired = true });
+})
+.WithName("ExpireAttention")
+.WithSummary("Allows previously dismissed problems to be suggested again.");
+
+app.MapPost("/api/suggestions/reset", (SuggestionEngine engine) =>
+{
+    engine.Reset();
+    return Results.Ok(new { reset = true });
+})
+.WithName("ResetSuggestions")
+.WithSummary("Clears the learned model, for demonstrating it learning from scratch.");
 
 app.Run();

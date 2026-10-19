@@ -20,6 +20,7 @@ public sealed class MeshSimulator : BackgroundService
     private readonly TelemetryArchive _archive;
     private readonly CommandStreamService _stream;
     private readonly DeviceIndex _index;
+    private readonly SuggestionEngine _engine;
     private readonly ILogger<MeshSimulator> _logger;
 
     // Seeded so every run produces the same sequence. A demo that behaves
@@ -31,23 +32,31 @@ public sealed class MeshSimulator : BackgroundService
     // How often the mesh publishes a round of telemetry.
     private static readonly TimeSpan PublishInterval = TimeSpan.FromMilliseconds(800);
 
+    // How often dismissed problems become suggestible again. A device
+    // glanced at five minutes ago and still broken deserves raising twice.
+    private static readonly TimeSpan AttentionLifetime = TimeSpan.FromMinutes(5);
+
     // Chance per node per round of an injected anomalous spike.
     private const double SpikeChance = 0.004;
 
     // Chance per node per round of the node going silent.
     private const double DropoutChance = 0.002;
 
+    private DateTimeOffset _lastAttentionExpiry = DateTimeOffset.UtcNow;
+
     public MeshSimulator(
         DeviceRegistry registry,
         TelemetryArchive archive,
         CommandStreamService stream,
         DeviceIndex index,
+        SuggestionEngine engine,
         ILogger<MeshSimulator> logger)
     {
         _registry = registry;
         _archive = archive;
         _stream = stream;
         _index = index;
+        _engine = engine;
         _logger = logger;
     }
 
@@ -92,6 +101,8 @@ public sealed class MeshSimulator : BackgroundService
                 // Drain the queues. Alerts first and in full, then whatever
                 // standard-queue budget is left.
                 _stream.ProcessTick();
+
+                ExpireAttentionIfDue();
             }
         }
         catch (OperationCanceledException)
@@ -100,6 +111,15 @@ public sealed class MeshSimulator : BackgroundService
         }
 
         _logger.LogInformation("Mesh simulator stopped.");
+    }
+
+    private void ExpireAttentionIfDue()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (now - _lastAttentionExpiry < AttentionLifetime) return;
+
+        _engine.ExpireAttention();
+        _lastAttentionExpiry = now;
     }
 
     // Registers the fictional deployment.
@@ -203,6 +223,7 @@ public sealed class MeshSimulator : BackgroundService
                 if (!node.DropoutReported)
                 {
                     node.DropoutReported = true;
+
                     _stream.RaiseAlert(new DeviceAlert
                     {
                         DeviceId = node.Profile.Id,
@@ -215,6 +236,15 @@ public sealed class MeshSimulator : BackgroundService
                     });
 
                     _index.RecordAlert(DateTimeOffset.UtcNow);
+
+                    // The alert is a situation the operator may respond to,
+                    // so the engine needs to see it to learn what follows.
+                    _engine.Record(new ActivityEvent
+                    {
+                        Kind = ActivityKind.Alert,
+                        Subject = node.Profile.Id,
+                        Detail = "disconnect"
+                    });
                 }
                 continue;
             }
@@ -307,9 +337,20 @@ public sealed class MeshSimulator : BackgroundService
             Message = $"Reading {magnitude:0.0} deviations {direction} baseline."
         });
 
-        // Only record it on the timeline if it was actually queued, so a
-        // suppressed duplicate does not inflate the graph.
-        if (queued) _index.RecordAlert(DateTimeOffset.UtcNow);
+        // Only record it if it was actually queued, so a suppressed
+        // duplicate neither inflates the graph nor pollutes the model with
+        // a situation the operator never actually saw.
+        if (queued)
+        {
+            _index.RecordAlert(DateTimeOffset.UtcNow);
+
+            _engine.Record(new ActivityEvent
+            {
+                Kind = ActivityKind.Alert,
+                Subject = node.Profile.Id,
+                Detail = alertType
+            });
+        }
     }
 
     private double NextValue(SimulatedNode node)
