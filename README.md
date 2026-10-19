@@ -1,632 +1,389 @@
-\# Smart-X IoT Mesh Ecosystem — Part 1
+# Smart-X IoT Mesh Ecosystem — Part 2
 
+Real-time processing and device management for the Smart-X hybrid IoT
+ecosystem. Part 1 built the ingestion gateway; Part 2 turns it into a
+processing engine with priority alert handling, manual device overrides with
+undo, constant-time lookups, and a predictive engine that learns operator
+behaviour.
 
+**Module:** PROG7312 / AAPD7112 — Programming 3B / Advanced Application Development
+**Student:** Thabang Thamae (ST10442590)
 
-Data ingestion and validation gateway for the Smart-X hybrid IoT ecosystem.
+---
 
-An ASP.NET Core Minimal API receives multi-typed telemetry from a mesh of
-
-ESP32 nodes; a Blazor WebAssembly console renders mesh health as a
-
-\*\*Sensor Health Pulse Grid\*\*, where severity is carried by colour, motion and
-
-opacity rather than by numbers.
-
-
-
-\*\*Module:\*\* PROG7312 — Programming 3B 
-
-\*\*Student:\*\* Thabang Thamae (ST10442590)
-
-
-
-\---
-
-
-
-\## Requirements
-
-
+## Requirements
 
 | Requirement | Version |
-
 |---|---|
-
 | .NET SDK | 10.0 or later |
-
 | Browser | Any modern browser with WebAssembly support |
-
-
 
 Check your SDK:
 
-
-
 ```bash
-
 dotnet --list-sdks
-
 ```
-
-
 
 If no `10.x` entry appears, install the .NET 10 SDK from
-
 <https://dotnet.microsoft.com/download>.
 
+---
 
-
-\---
-
-
-
-\## Quick start
-
-
+## Quick start
 
 ```bash
-
-git clone https://github.com/ST10442590/prog7312\_smartx\_part1.git
-
-cd prog7312\_smartx\_part1
-
+git clone https://github.com/ST10442590/prog7312_smartx_part2.git
+cd prog7312_smartx_part2
 dotnet restore
-
 dotnet build
-
 ```
 
-
-
-The API and the client are \*\*separate processes\*\* and both must be running.
-
+The API and the client are **separate processes** and both must be running.
 Open two terminals.
 
-
-
-\*\*Terminal 1 — the gateway API:\*\*
-
-
+**Terminal 1 — the gateway API:**
 
 ```bash
-
 dotnet run --project SmartX.Api
-
 ```
-
-
 
 Listens on `http://localhost:5145`. On startup it registers 24 simulated
-
 ESP32 nodes and begins publishing telemetry every 800 ms.
 
-
-
-\*\*Terminal 2 — the dashboard client:\*\*
-
-
+**Terminal 2 — the dashboard client:**
 
 ```bash
-
 dotnet run --project SmartX.Client
-
 ```
-
-
 
 Listens on `http://localhost:5006` and opens a browser automatically.
 
-
-
 Stop either with `Ctrl+C`.
 
+> **Start the API first.** The client polls the gateway and will show
+> "Gateway unreachable" until the API answers. It reconnects on its own once
+> the API is up — no client restart needed.
 
+> **Stop the API before rebuilding.** A running process holds a lock on
+> `SmartX.Api.exe`, and the build cannot overwrite it.
 
-> \*\*Start the API first.\*\* The client polls the gateway every 900 ms and will
+---
 
-> show "Gateway unreachable" until the API answers. It reconnects on its own
+## Testing the Part 2 data structures
 
-> once the API is up — no client restart needed.
+Every structure can be exercised from the **Command Stream** page at
+`http://localhost:5006/stream`, or directly against the API. The depth
+counters at the top of that page update roughly once a second, so each
+structure can be watched filling and draining.
 
+### Priority queue — making a critical alert bypass the stream
 
+The standard FIFO queue holds routine telemetry. Critical alerts skip it
+entirely and are released first, in severity order.
 
-\---
+**From the dashboard:** in the *Alert queue* panel, pick a device, set
+severity to **Critical**, and click **Inject alert**. It appears at the top
+of the queue regardless of what is already waiting.
 
+**From the command line:**
 
-
-\## Solution structure
-
-
-
+```bash
+curl -X POST "http://localhost:5145/api/stream/simulate-alert?deviceId=ESP32-A00&severity=Critical"
 ```
 
+To see the ordering clearly, inject a low-severity alert first and a
+critical one immediately after, then read the queue:
+
+```bash
+curl -X POST "http://localhost:5145/api/stream/simulate-alert?deviceId=ESP32-B01&severity=Informational"
+curl -X POST "http://localhost:5145/api/stream/simulate-alert?deviceId=ESP32-A00&severity=Critical"
+curl http://localhost:5145/api/stream/snapshot
+```
+
+`pendingAlerts` lists them in dequeue order: the Critical alert is first even
+though it arrived second.
+
+### HashSet — duplicate alert suppression
+
+Inject the **same alert twice**. The first is queued; the second is refused,
+because the active-alert set already holds that condition.
+
+```bash
+curl -X POST "http://localhost:5145/api/stream/simulate-alert?deviceId=ESP32-A00&severity=Critical"
+curl -X POST "http://localhost:5145/api/stream/simulate-alert?deviceId=ESP32-A00&severity=Critical"
+```
+
+The first returns `"queued": true`; the second returns
+`"suppressedAsDuplicate": true`. The `duplicatesSuppressed` counter on the
+dashboard shows the running total — without this set, a node that drops out
+for ninety seconds would raise the same alert on every poll.
+
+### Stack — undoing manual overrides
+
+In the *Manual override* panel, send three commands to different devices,
+then click **Undo last** three times. The stack unwinds newest-first, and the
+entry marked *next undo* is always the one that will be reverted.
+
+```bash
+curl -X POST http://localhost:5145/api/stream/command \
+  -H "Content-Type: application/json" \
+  -d "{\"deviceId\":\"ESP32-F05\",\"kind\":0,\"newState\":true}"
+
+curl -X POST http://localhost:5145/api/stream/undo
+```
+
+Undo applies the *inverse* of the popped command rather than deleting
+history, so the audit trail stays intact.
+
+### Dictionary — constant-time MAC lookup
+
+Devices are indexed by MAC address, so resolving an incoming packet does not
+require scanning the device list.
+
+```bash
+curl http://localhost:5145/api/index/by-mac/5C:CF:7F:00:00:00
+curl http://localhost:5145/api/index/by-category/PowerConsumption
+curl http://localhost:5145/api/index/stats
+```
+
+`indexStats` reports hits, misses and rebuilds. The category index is a
+second dictionary, so filtering by category is also a lookup rather than a
+scan.
+
+### SortedDictionary — ordered timeline
+
+```bash
+curl "http://localhost:5145/api/index/timeline?take=20"
+curl "http://localhost:5145/api/index/timeline/range?fromSecondsAgo=60&toSecondsAgo=0"
+```
+
+Entries come back in chronological order with no sort performed at request
+time — ordering is a property of the structure. The range query stops
+scanning as soon as it passes the end of the range.
+
+### Predictive engine — teaching it a pattern
+
+The engine learns what you do after a given situation. Search two devices in
+sequence, twice, then return to the first:
+
+```bash
+curl "http://localhost:5145/api/suggestions/search?query=ESP32-A00"
+curl "http://localhost:5145/api/suggestions/search?query=ESP32-B01"
+curl "http://localhost:5145/api/suggestions/search?query=ESP32-A00"
+curl "http://localhost:5145/api/suggestions/search?query=ESP32-B01"
+curl "http://localhost:5145/api/suggestions/search?query=ESP32-A00"
+curl http://localhost:5145/api/suggestions
+```
+
+A suggestion for ESP32-B01 appears, with the rationale *"After searched
+ESP32-A00, you searched it 2 of the last 2 times."* The same sequence works
+from the search box on the Command Stream page.
+
+> The model is in-memory. Restarting the API clears it, which is useful for
+> demonstrating it learning from nothing.
+
+---
+
+## Solution structure
+
+```
 SmartX/
-
 ├── SmartX.Shared/     Class library referenced by both other projects
-
 │   ├── Telemetry/     TelemetryPacket<T>, SensorReading, health windows, DTOs
-
+│   ├── Commands/      Commands, alerts, suggestion and stream DTOs
 │   ├── Sensors/       Registration profiles, categories, units, health states
-
 │   ├── Collections/   RingBuffer<T>, jagged-array batch buffer
-
 │   └── Topology/      Deployment tree and recursive validator
-
 ├── SmartX.Api/        Minimal API gateway
-
-│   └── Services/      Device registry, mesh simulator, topology builder
-
+│   └── Services/      Registry, simulator, archive, command stream,
+│                      lookup index, suggestion engine, topology builder
 └── SmartX.Client/     Blazor WebAssembly console
-
-&#x20;   ├── Components/    PulseTile
-
-&#x20;   ├── Pages/         Dashboard, sensor registry
-
-&#x20;   └── Services/      Typed API client
-
+    ├── Components/    PulseTile
+    ├── Pages/         Dashboard, registry, diagnostics, command stream
+    └── Services/      Typed API client
 ```
 
+Domain types live in `SmartX.Shared` so the same validation logic runs in the
+browser and on the server. Registration errors a user sees while typing are
+produced by the identical method the API runs on submission.
 
+---
 
-Domain types live in `SmartX.Shared` so that the same validation logic runs
+## Navigation
 
-in the browser and on the server. Registration errors a user sees while
+Four modules are active; the third architectural pillar is visible but
+disabled so the intended architecture is legible from the first screen.
 
-typing are produced by the identical method the API runs on submission, so
+| Module | Route | Part |
+|---|---|---|
+| Sensor Data Ingestion | `/` | 1 |
+| Sensor Registry | `/devices` | 1 |
+| Pipeline Diagnostics | `/diagnostics` | 1 |
+| Real-Time Command Stream | `/stream` | 2 |
+| Network Topology and Mesh Routing | — | Final PoE |
 
-the two can never drift apart.
+Routing is client-side, so switching modules does not reload the application
+or interrupt the polling loops. Each page disposes its own timer on
+navigation, which is why moving between views does not leave orphaned
+requests running against the API.
 
+---
 
+## API reference
 
-\---
-
-
-
-\## API reference
-
-
+### Part 2 — command stream
 
 | Method | Route | Purpose |
-
 |---|---|---|
+| `GET` | `/api/stream/snapshot` | Depths and contents of all four structures |
+| `POST` | `/api/stream/command` | Issue a manual override |
+| `POST` | `/api/stream/undo` | Revert the most recent command |
+| `POST` | `/api/stream/simulate-alert` | Inject a test alert |
 
+### Part 2 — lookups
+
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/api/index/stats` | Index and timeline counters |
+| `GET` | `/api/index/by-mac/{mac}` | O(1) MAC resolution |
+| `GET` | `/api/index/by-category/{category}` | Category index |
+| `GET` | `/api/index/timeline` | Ordered timeline |
+| `GET` | `/api/index/timeline/range` | Range query |
+
+### Part 2 — suggestions
+
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/api/suggestions` | Recommendations and the learned model |
+| `GET` | `/api/suggestions/search` | Device search, also a training signal |
+| `POST` | `/api/suggestions/attend/{deviceId}` | Dismiss a suggestion |
+| `POST` | `/api/suggestions/reset` | Clear the learned model |
+
+### Part 1 — ingestion, devices, diagnostics
+
+| Method | Route | Purpose |
+|---|---|---|
 | `GET` | `/api/health` | Liveness probe |
-
 | `POST` | `/api/telemetry` | Ingest one packet |
-
 | `POST` | `/api/telemetry/batch` | Ingest a buffered batch |
-
 | `GET` | `/api/devices` | List registered sensors |
-
-| `GET` | `/api/devices/{id}` | One sensor profile |
-
 | `POST` | `/api/devices` | Register or update a sensor |
-
 | `POST` | `/api/devices/{id}/attachments` | Upload a config file, photo or log |
-
-| `GET` | `/api/devices/{id}/attachments` | List attachments |
-
 | `GET` | `/api/mesh/health` | Pulse Grid tiles, worst first |
-
 | `GET` | `/api/mesh/summary` | Mesh-wide counters |
-
-| `GET` | `/api/topology/tree` | Deployment tree |
-
 | `GET` | `/api/topology/validate` | Recursive validation report |
-
-| `GET` | `/api/topology/path/{deviceId}` | Recursive ancestry lookup |
-
-
+| `GET` | `/api/diagnostics/benchmark` | Insertion and search timings |
 
 OpenAPI document (development only): `http://localhost:5145/openapi/v1.json`
 
+---
 
+## Design notes
 
-\### Posting a packet manually
+### Why these structures
 
+**`Queue<T>`** holds routine telemetry. Readings must be processed in arrival
+order, because a packet overtaking an earlier one would corrupt the timeline
+the archive's binary search depends on.
 
+**`PriorityQueue<DeviceAlert, long>`** holds alerts. The priority is
+`severity × 1,000,000 + sequence`: severity dominates, and the sequence
+number breaks ties. Without that tiebreaker two Critical alerts could be
+released in the wrong order relative to each other, since `PriorityQueue` is
+not a stable sort.
 
-```bash
+**`Stack<DeviceCommand>`** holds the override history. Undo applies the
+inverse of the popped command rather than deleting it, so the audit trail
+survives.
 
-curl -X POST http://localhost:5145/api/telemetry \\
+**`HashSet<string>`** holds active alert conditions, keyed on
+`device|severity|type`. `Add` returns false when the key is already present,
+making the check and the insert one constant-time operation. Conditions clear
+when a device recovers, so the set does not grow without bound and a node
+that fails twice can alarm twice.
 
-&#x20; -H "Content-Type: application/json" \\
+**`Dictionary<string, SensorProfile>`** resolves MAC addresses. Scanning a
+device list is O(n) per packet, which at the thousands of nodes the brief
+describes would be paid on every reading.
 
-&#x20; -d "{\\"deviceId\\":\\"ESP32-A00\\",\\"kind\\":0,\\"value\\":21.6,\\"category\\":0,\\"unit\\":1}"
+**`SortedDictionary<DateTimeOffset, TimelinePoint>`** holds the timeline.
+Packets usually arrive in time order but not always — a delayed node can
+report late, and a plain dictionary would leave that reading out of sequence.
+
+### How the suggestion engine works
+
+The model is a first-order Markov transition table:
 
 ```
-
-
-
-`kind` is `0` float, `1` integer, `2` boolean.
-
-
-
-\---
-
-
-
-\## The engagement strategy: Sensor Health Pulse Grid
-
-
-
-The dashboard implements \*\*pre-attentive anomaly encoding\*\*. Three visual
-
-channels carry state simultaneously:
-
-
-
-\- \*\*Hue\*\* encodes deviation from each node's own rolling baseline
-
-\- \*\*A ring pulse\*\* fires when a packet arrives, so throughput is felt as motion
-
-\- \*\*Opacity and a counter\*\* mark silence, so a dropped node grows more visually
-
-&#x20; distinct over time rather than quietly vanishing
-
-
-
-Scoring is per device, not global. A greenhouse humidity sensor at 85% and a
-
-server-room sensor at 30% are both normal for where they are, so a single
-
-global threshold would either spam false alarms or miss real ones. Each node
-
-is instead scored by z-score — how many standard deviations its latest
-
-reading sits from its own recent mean — which puts every channel on one
-
-comparable scale.
-
-
-
-| Band | Condition |
-
-|---|---|
-
-| Nominal | \\|z\\| < 1.5 |
-
-| Drift | 1.5 ≤ \\|z\\| < 3 |
-
-| Spike | \\|z\\| ≥ 3 |
-
-| Disconnected | No packet for 30 s |
-
-
-
-Every tile also carries an ARIA live region with the same state in words, so
-
-the information reaches screen-reader users and not only those watching the
-
-colour.
-
-
-
-\---
-
-
-
-\## Advanced OOP concepts
-
-
-
-\### Generics — `TelemetryPacket<T>`
-
-
-
-A reusable wrapper constrained to `where T : struct`, carrying a float for
-
-soil moisture, an int for power wattage or a bool for a valve state.
-
-
-
-Widening a generic value to a double is normally done with
-
-`Convert.ToDouble(value)`, which \*\*boxes\*\*: the struct is copied to the heap,
-
-an object header is allocated, and the GC must later collect it. At thousands
-
-of packets per second that is a per-packet heap allocation.
-
-`NumericProjector<T>` instead caches one delegate per closed generic type and
-
-uses `Unsafe.As` to reinterpret the value in place, so no allocation occurs.
-
-`ITelemetryPacket` deliberately exposes `NumericValue` as a `double` rather
-
-than `object Value`, since the latter would reintroduce boxing wherever a
-
-heterogeneous collection was read.
-
-
-
-\### Operator overloading — `SensorReading`
-
-
-
-A `readonly struct` with arithmetic defined directly on it:
-
-
-
-```csharp
-
-SensorReading total = meter1 + meter2;   // aggregate load
-
-SensorReading drift = current - baseline; // delta against baseline
-
-if (current > threshold) RaiseSpike();
-
+Dictionary<string, Dictionary<string, int>>
+   situation  ->   next action  ->  times observed
 ```
 
+Three constraints keep it honest:
 
+- Only **operator actions** can be the target of a learned transition. Two
+  unrelated alerts firing in the same window is coincidence, not behaviour.
+- Transitions must occur within **three minutes**. Something done ten minutes
+  later is a separate task, not a response.
+- A pattern must be seen **at least twice** before it is suggested.
 
-`+` tracks a `SourceCount` so `Mean` stays correct after repeated
+Suggestions come from two sources. *Learned transitions* predict what the
+operator usually does next. *Unattended anomalies* surface devices that are
+degrading but have not been looked at — the proactive half.
 
-aggregation. Both `+` and `-` throw when units differ, because adding watts
+Every suggestion carries its rationale, so a recommendation can be traced to
+the observations that produced it. An operator who cannot see why a system is
+recommending something will not act on it.
 
-to degrees Celsius produces a number that looks valid and means nothing.
+---
 
-`==` is exact structural equality, keeping it consistent with `GetHashCode`;
+## Troubleshooting
 
-`ApproximatelyEquals` provides the tolerance-based comparison that floating
-
-point usually needs.
-
-
-
-\### Arrays — jagged and multi-dimensional
-
-
-
-`TelemetryBatchBuffer` stages raw telemetry in a jagged `double\[]\[]` before
-
-draining into a `List<SensorReading>` sized once to the exact capacity
-
-needed. Jagged rather than rectangular because batch sizes vary — one zone
-
-may send 12 readings while another sends 4,000, and a rectangular array would
-
-pad every short batch to the longest. The zone-by-category tally alongside it
-
-is a genuinely rectangular `int\[,]`, since every zone has the same three
-
-category slots.
-
-
-
-\### Recursion — `RecursiveTopologyValidator`
-
-
-
-Walks the deployment tree (Facility → Zone → Sub-Zone → Device) verifying
-
-tier ordering, MAC presence, and that any device requiring mains power sits
-
-inside an ancestry that supplies it. Three guards keep it safe on deep or
-
-malformed input: the natural leaf base case, a hard depth ceiling of 64, and
-
-a visited set that reports cycles instead of following them forever.
-
-`FindPath` recursively resolves a device's ancestry with backtracking on
-
-dead-end branches.
-
-
-
-\### Collections — `RingBuffer<T>`
-
-
-
-A custom fixed-capacity circular buffer. `List<T>` would grow without bound
-
-and `Queue<T>` reallocates as it grows; this buffer allocates its array once
-
-at construction and never again, however many packets pass through. Since one
-
-window exists per device across the whole mesh, that property is what keeps
-
-memory flat. Enumeration uses a struct enumerator, so iterating a window
-
-allocates nothing on the heap.
-
-
-
-\---
-
-
-
-\## Data seeding
-
-
-
-`MeshSimulator` is a `BackgroundService` that registers 24 nodes across
-
-two zones and four sub-zones — environmental, power and actuator channels —
-
-then publishes readings every 800 ms.
-
-
-
-Values are generated with Gaussian noise via Box-Muller so the baseline looks
-
-like real sensor scatter rather than a uniform band. Faults are injected at
-
-low probability: spikes of six to ten times normal noise, and dropouts where
-
-the node simply stops publishing. Nothing announces a dropout — the dashboard
-
-infers it from silence, which is how a real mesh behaves when a node loses
-
-power.
-
-
-
-The random seed is fixed, so every run produces the same sequence.
-
-
-
-Tuning constants are at the top of `SmartX.Api/Services/MeshSimulator.cs`:
-
-
-
-```csharp
-
-private static readonly TimeSpan PublishInterval = TimeSpan.FromMilliseconds(800);
-
-private const double SpikeChance = 0.004;
-
-private const double DropoutChance = 0.002;
-
-```
-
-
-
-\---
-
-
-
-\## File upload
-
-
-
-Config files, deployment photos and hardware logs attach to a sensor profile
-
-from the Sensor Registry page. Accepted: `.json`, `.yaml`, `.yml`, `.txt`,
-
-`.log`, `.csv`, `.cfg`, `.ini`, `.png`, `.jpg`, `.jpeg`, `.webp`, up to 25 MB.
-
-
-
-The upload streams to disk with `CopyToAsync` rather than buffering the file
-
-into a byte array, and the stored filename is \*\*generated server-side\*\* — a
-
-client-supplied name such as `../../appsettings.json` would otherwise escape
-
-the upload directory. A SHA-256 hash is recorded for integrity checking.
-
-
-
-Files are written to `SmartX.Api/uploads/{deviceId}/`, which is git-ignored.
-
-
-
-\---
-
-
-
-\## Troubleshooting
-
-
-
-\*\*"Gateway unreachable" on the dashboard\*\*
-
+**"Gateway unreachable" on the dashboard**
 The API is not running, or is on a different port. Confirm the API terminal
-
 shows `Now listening on: http://localhost:5145`.
 
+**Build fails with "file is locked by SmartX.Api"**
+The API is still running. Stop it with `Ctrl+C`, or
+`taskkill /IM SmartX.Api.exe /F`.
 
-
-\*\*CORS errors in the browser console\*\*
-
+**CORS errors in the browser console**
 The API allows only `http://localhost:5006` and `https://localhost:7296`. If
-
 your client started on a different port, update `WithOrigins` in
+`SmartX.Api/Program.cs`.
 
-`SmartX.Api/Program.cs` to match.
+**Suggestions panel is empty**
+The model is in-memory and resets with the API. Run the training sequence
+above, and check within five minutes — that is the context window.
 
-
-
-\*\*Port already in use\*\*
-
+**Port already in use**
 Change `applicationUrl` in the relevant `Properties/launchSettings.json`, and
-
 update the CORS origins if it was the client that moved.
 
+---
 
+## References
 
-\*\*Build fails on `Unsafe.As`\*\*
-
-`SmartX.Shared.csproj` must contain
-
-`<AllowUnsafeBlocks>true</AllowUnsafeBlocks>`.
-
-
-
-\---
-
-
-
-\## Scope
-
-
-
-Part 1 implements the first architectural pillar, Sensor Data Ingestion and
-
-Telemetry. The other two appear in the navigation as disabled, so the
-
-intended architecture is legible from the first screen:
-
-
-
-\- \*\*Real-Time Command Stream and History\*\* — Part 2
-
-\- \*\*Network Topology and Mesh Routing\*\* — final PoE
-
-
-
-\---
-
-**Video demonstration:** https://youtu.be/QttUoJv4Rkw
-
-\## References
-
-
-
-Ancker, J.S., Edwards, A., Nosal, S., Hauser, D., Mauer, E. \& Kaushal, R.
-
-2017\. Effects of workload, work complexity, and repeated alerts on alert
-
-fatigue in a clinical decision support system. \*BMC Medical Informatics and
-
-Decision Making\*, 17(36):1–9.
-
-
+Ancker, J.S., Edwards, A., Nosal, S., Hauser, D., Mauer, E. & Kaushal, R.
+2017. Effects of workload, work complexity, and repeated alerts on alert
+fatigue in a clinical decision support system. *BMC Medical Informatics and
+Decision Making*, 17(36):1–9.
 
 Endsley, M.R. 1995. Toward a theory of situation awareness in dynamic
+systems. *Human Factors*, 37(1):32–64.
 
-systems. \*Human Factors\*, 37(1):32–64.
+Healey, C.G. & Enns, J.T. 2012. Attention and visual memory in visualization
+and computer graphics. *IEEE Transactions on Visualization and Computer
+Graphics*, 18(7):1170–1188.
 
+Koivisto, J. & Hamari, J. 2019. The rise of motivational information systems:
+a review of gamification research. *International Journal of Information
+Management*, 45:191–210.
 
-
-Healey, C.G. \& Enns, J.T. 2012. Attention and visual memory in visualization
-
-and computer graphics. \*IEEE Transactions on Visualization and Computer
-
-Graphics\*, 18(7):1170–1188.
-
-
-
-Koivisto, J. \& Hamari, J. 2019. The rise of motivational information systems:
-
-a review of gamification research. \*International Journal of Information
-
-Management\*, 45:191–210.
-
-
-
-Stelea, G.A., Sangeorzan, L. \& Enache-David, N. 2025. Accessible IoT
-
+Stelea, G.A., Sangeorzan, L. & Enache-David, N. 2025. Accessible IoT
 dashboard design with AI-enhanced descriptions for visually impaired users.
+*Future Internet*, 17(7):274.
 
-\*Future Internet\*, 17(7):274.
-
-
-
-Zong, J., Lee, C., Lundgard, A., Jang, J., Hajas, D. \& Satyanarayan, A. 2022.
-
-Rich screen reader experiences for accessible data visualization. \*Computer
-
-Graphics Forum\*, 41(3):15–27.
-
+Zong, J., Lee, C., Lundgard, A., Jang, J., Hajas, D. & Satyanarayan, A. 2022.
+Rich screen reader experiences for accessible data visualization. *Computer
+Graphics Forum*, 41(3):15–27.
