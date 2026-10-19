@@ -1,26 +1,24 @@
-﻿using SmartX.Shared.Sensors;
+﻿using SmartX.Shared.Commands;
+using SmartX.Shared.Sensors;
 using SmartX.Shared.Telemetry;
 
 namespace SmartX.Api.Services;
 
-/// <summary>
-/// Simulates a mesh of ESP32 nodes publishing telemetry continuously.
-/// </summary>
-/// <remarks>
-/// <para>The brief treats the physical mesh as a simulation, so this service
-/// stands in for it: it registers a fictional deployment on startup and then
-/// publishes readings on a timer for as long as the API runs.</para>
-///
-/// <para>Each node has its own baseline and noise level, so the dashboard
-/// shows genuinely heterogeneous data rather than one repeated waveform.
-/// Faults are injected at a low probability — a spike large enough to cross
-/// the z-score threshold, or a temporary dropout — so the Pulse Grid can be
-/// seen reacting live during a demo instead of sitting uniformly green.</para>
-/// </remarks>
+// Simulates a mesh of ESP32 nodes publishing telemetry continuously.
+//
+// The brief treats the physical mesh as a simulation, so this service stands
+// in for it: it registers a fictional deployment on startup and then
+// publishes readings on a timer for as long as the API runs.
+//
+// Each node has its own baseline and noise level, so the dashboard shows
+// genuinely heterogeneous data rather than one repeated waveform. Faults are
+// injected at a low probability so the Pulse Grid and the alert queue can be
+// seen reacting live during a demo.
 public sealed class MeshSimulator : BackgroundService
 {
     private readonly DeviceRegistry _registry;
     private readonly TelemetryArchive _archive;
+    private readonly CommandStreamService _stream;
     private readonly ILogger<MeshSimulator> _logger;
 
     // Seeded so every run produces the same sequence. A demo that behaves
@@ -29,26 +27,28 @@ public sealed class MeshSimulator : BackgroundService
 
     private readonly List<SimulatedNode> _nodes = new();
 
-    /// <summary>How often the mesh publishes a round of telemetry.</summary>
+    // How often the mesh publishes a round of telemetry.
     private static readonly TimeSpan PublishInterval = TimeSpan.FromMilliseconds(800);
 
-    /// <summary>Chance per node per round of an injected anomalous spike.</summary>
+    // Chance per node per round of an injected anomalous spike.
     private const double SpikeChance = 0.004;
 
-    /// <summary>Chance per node per round of the node going silent.</summary>
+    // Chance per node per round of the node going silent.
     private const double DropoutChance = 0.002;
 
     public MeshSimulator(
         DeviceRegistry registry,
         TelemetryArchive archive,
+        CommandStreamService stream,
         ILogger<MeshSimulator> logger)
     {
         _registry = registry;
         _archive = archive;
+        _stream = stream;
         _logger = logger;
     }
 
-    /// <summary>One simulated device and the shape of the signal it produces.</summary>
+    // One simulated device and the shape of the signal it produces.
     private sealed class SimulatedNode
     {
         public required SensorProfile Profile { get; init; }
@@ -57,8 +57,12 @@ public sealed class MeshSimulator : BackgroundService
         public required double Noise { get; init; }
         public long Sequence { get; set; }
 
-        /// <summary>Rounds remaining before this node starts publishing again.</summary>
+        // Rounds remaining before this node starts publishing again.
         public int SilentRounds { get; set; }
+
+        // True while this node has an unresolved dropout alert, so the
+        // recovery clear only fires once.
+        public bool DropoutReported { get; set; }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -77,6 +81,10 @@ public sealed class MeshSimulator : BackgroundService
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
                 PublishRound();
+
+                // Drain the queues. Alerts first and in full, then whatever
+                // standard-queue budget is left.
+                _stream.ProcessTick();
             }
         }
         catch (OperationCanceledException)
@@ -87,7 +95,7 @@ public sealed class MeshSimulator : BackgroundService
         _logger.LogInformation("Mesh simulator stopped.");
     }
 
-    /// <summary>Registers the fictional deployment.</summary>
+    // Registers the fictional deployment.
     private void SeedMesh()
     {
         // Facility A -> Zone 1 / Zone 2 -> Sub-Zone A / Sub-Zone B
@@ -166,11 +174,9 @@ public sealed class MeshSimulator : BackgroundService
     private static string FormatMac(int index) =>
         $"5C:CF:7F:{index / 256 % 256:X2}:{index % 256:X2}:{(index * 7) % 256:X2}";
 
-    /// <summary>
-    /// Publishes one round as a batch. Each node's packet is collected into
-    /// a list first, then transmitted in a single call — which is how a real
-    /// gateway forwards a buffered window rather than one packet at a time.
-    /// </summary>
+    // Publishes one round as a batch. Each node's packet is collected into a
+    // list first, then transmitted in a single call — which is how a real
+    // gateway forwards a buffered window rather than one packet at a time.
     private void PublishRound()
     {
         var batch = new List<ITelemetryPacket>(_nodes.Count);
@@ -182,7 +188,35 @@ public sealed class MeshSimulator : BackgroundService
             if (node.SilentRounds > 0)
             {
                 node.SilentRounds--;
+
+                // The dropout alert is raised once per outage, not once per
+                // round. The HashSet would suppress the repeats anyway, but
+                // not even attempting them keeps the suppression count
+                // meaningful rather than inflated by this loop.
+                if (!node.DropoutReported)
+                {
+                    node.DropoutReported = true;
+                    _stream.RaiseAlert(new DeviceAlert
+                    {
+                        DeviceId = node.Profile.Id,
+                        DeviceName = node.Profile.DisplayName,
+                        LocationPath = node.Profile.LocationPath,
+                        Category = node.Profile.Category,
+                        Severity = AlertSeverity.High,
+                        AlertType = "disconnect",
+                        Message = "Node stopped publishing — no heartbeat."
+                    });
+                }
                 continue;
+            }
+
+            // The node is publishing again, so clear its outage conditions
+            // and let it alarm afresh if it fails later.
+            if (node.DropoutReported)
+            {
+                node.DropoutReported = false;
+                _stream.ClearAlertsFor(node.Profile.Id);
+                _logger.LogInformation("Node {Id} recovered.", node.Profile.Id);
             }
 
             if (_random.NextDouble() < DropoutChance)
@@ -206,12 +240,60 @@ public sealed class MeshSimulator : BackgroundService
             var packet = dto.ToPacket();
             batch.Add(packet);
 
-            // Live scoring for the Pulse Grid.
-            _registry.Observe(packet);
+            // Standard path: join the back of the FIFO queue.
+            _stream.EnqueuePacket(packet);
+
+            // Live scoring for the Pulse Grid, which also tells us whether
+            // this reading warrants an alert.
+            var score = _registry.Observe(packet);
+            if (score is { } z) MaybeRaiseAlert(node, z);
         }
 
         // Batch transmission into the historical archive.
         if (batch.Count > 0) _archive.Ingest(batch, TelemetryUnit.None);
+    }
+
+    // Converts a z-score into an alert, if it is far enough out. Severity
+    // decides queue position, so a severe power spike is dequeued ahead of a
+    // merely elevated environmental reading no matter which arrived first.
+    private void MaybeRaiseAlert(SimulatedNode node, double z)
+    {
+        var magnitude = Math.Abs(z);
+
+        var alertType = node.Profile.Category == SensorCategory.PowerConsumption
+            ? "power-spike"
+            : "reading-anomaly";
+
+        // The node is back within normal range, so clear its anomaly
+        // condition and let it alarm again if it spikes later. Without this
+        // the active-alert set grows forever and a device could only ever
+        // raise each alert type once for the lifetime of the process.
+        if (magnitude < 1.5)
+        {
+            _stream.ClearAlert($"{node.Profile.Id}|{AlertSeverity.Critical}|{alertType}");
+            _stream.ClearAlert($"{node.Profile.Id}|{AlertSeverity.High}|{alertType}");
+            return;
+        }
+
+        if (magnitude < 3.0) return;
+
+        var severity = magnitude >= 5.0
+            ? AlertSeverity.Critical
+            : AlertSeverity.High;
+
+        var direction = z > 0 ? "above" : "below";
+
+        _stream.RaiseAlert(new DeviceAlert
+        {
+            DeviceId = node.Profile.Id,
+            DeviceName = node.Profile.DisplayName,
+            LocationPath = node.Profile.LocationPath,
+            Category = node.Profile.Category,
+            Severity = severity,
+            ZScore = Math.Round(z, 2),
+            AlertType = alertType,
+            Message = $"Reading {magnitude:0.0} deviations {direction} baseline."
+        });
     }
 
     private double NextValue(SimulatedNode node)

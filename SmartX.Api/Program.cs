@@ -1,4 +1,5 @@
 using SmartX.Api.Services;
+using SmartX.Shared.Commands;
 using SmartX.Shared.Sensors;
 using SmartX.Shared.Telemetry;
 
@@ -8,6 +9,7 @@ var builder = WebApplication.CreateBuilder(args);
 // every request and by the background simulator.
 builder.Services.AddSingleton<DeviceRegistry>();
 builder.Services.AddSingleton<TelemetryArchive>();
+builder.Services.AddSingleton<CommandStreamService>();
 builder.Services.AddScoped<TopologyBuilder>();
 builder.Services.AddHostedService<MeshSimulator>();
 
@@ -49,7 +51,10 @@ app.MapGet("/api/health", () => Results.Ok(new
 // ------------------------------------------------------------ ingestion
 // The primary receiver of telemetry. Accepts one packet from a node.
 app.MapPost("/api/telemetry", (
-    TelemetryPacketDto dto, DeviceRegistry registry, TelemetryArchive archive) =>
+    TelemetryPacketDto dto,
+    DeviceRegistry registry,
+    TelemetryArchive archive,
+    CommandStreamService stream) =>
 {
     var errors = dto.Validate();
     if (errors.Count > 0)
@@ -68,6 +73,7 @@ app.MapPost("/api/telemetry", (
     }
 
     archive.Ingest([packet], dto.Unit);
+    stream.EnqueuePacket(packet);
 
     return Results.Ok(new { dto.DeviceId, zScore = Math.Round(score.Value, 2) });
 })
@@ -78,7 +84,8 @@ app.MapPost("/api/telemetry", (
 app.MapPost("/api/telemetry/batch", (
     TelemetryPacketDto[] packets,
     DeviceRegistry registry,
-    TelemetryArchive archive) =>
+    TelemetryArchive archive,
+    CommandStreamService stream) =>
 {
     var accepted = new List<ITelemetryPacket>(packets.Length);
     var rejected = new List<string>();
@@ -99,6 +106,7 @@ app.MapPost("/api/telemetry/batch", (
         }
 
         accepted.Add(packet);
+        stream.EnqueuePacket(packet);
     }
 
     // The whole accepted window is staged in one call, which is what the
@@ -325,5 +333,67 @@ app.MapGet("/api/diagnostics/benchmark", () =>
     Results.Ok(TelemetryArchive.Benchmark([1_000, 10_000, 50_000, 200_000])))
 .WithName("RunBenchmark")
 .WithSummary("Times insertion and search against growing volumes.");
+
+// ----------------------------------------------------- command stream
+// Live depths of the FIFO queue, the priority alert queue and the undo
+// stack, plus the duplicate-suppression counter from the active-alert set.
+app.MapGet("/api/stream/snapshot", (CommandStreamService stream) =>
+    Results.Ok(stream.Snapshot()))
+.WithName("GetStreamSnapshot")
+.WithSummary("Current depths and contents of the processing structures.");
+
+// Issues a manual override and pushes it onto the undo stack.
+app.MapPost("/api/stream/command", (
+    IssueCommandDto request, CommandStreamService stream) =>
+{
+    var result = stream.Issue(request);
+    return result.Succeeded ? Results.Ok(result) : Results.BadRequest(result);
+})
+.WithName("IssueCommand")
+.WithSummary("Issues a manual override command to a device.");
+
+// Pops the most recent command and applies its inverse.
+app.MapPost("/api/stream/undo", (CommandStreamService stream) =>
+{
+    var result = stream.Undo();
+    return result.Succeeded ? Results.Ok(result) : Results.BadRequest(result);
+})
+.WithName("UndoCommand")
+.WithSummary("Reverts the most recently issued command.");
+
+// Injects a critical alert on demand, so the priority queue can be seen
+// jumping it ahead of a backlog during a demo.
+app.MapPost("/api/stream/simulate-alert", (
+    string deviceId, AlertSeverity severity, DeviceRegistry registry,
+    CommandStreamService stream) =>
+{
+    var profile = registry.GetProfile(deviceId);
+    if (profile is null)
+    {
+        return Results.NotFound(new { error = $"Device '{deviceId}' is not registered." });
+    }
+
+    var queued = stream.RaiseAlert(new DeviceAlert
+    {
+        DeviceId = profile.Id,
+        DeviceName = profile.DisplayName,
+        LocationPath = profile.LocationPath,
+        Category = profile.Category,
+        Severity = severity,
+        AlertType = "manual-test",
+        Message = $"Operator-injected {severity} alert."
+    });
+
+    // queued = false means the active-alert set suppressed it as a
+    // duplicate, which is itself worth surfacing rather than hiding.
+    return Results.Ok(new
+    {
+        queued,
+        suppressedAsDuplicate = !queued,
+        snapshot = stream.Snapshot()
+    });
+})
+.WithName("SimulateAlert")
+.WithSummary("Raises a test alert, demonstrating priority ordering and dedupe.");
 
 app.Run();
