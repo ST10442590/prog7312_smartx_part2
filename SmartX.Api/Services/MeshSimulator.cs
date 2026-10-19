@@ -19,6 +19,7 @@ public sealed class MeshSimulator : BackgroundService
     private readonly DeviceRegistry _registry;
     private readonly TelemetryArchive _archive;
     private readonly CommandStreamService _stream;
+    private readonly DeviceIndex _index;
     private readonly ILogger<MeshSimulator> _logger;
 
     // Seeded so every run produces the same sequence. A demo that behaves
@@ -40,11 +41,13 @@ public sealed class MeshSimulator : BackgroundService
         DeviceRegistry registry,
         TelemetryArchive archive,
         CommandStreamService stream,
+        DeviceIndex index,
         ILogger<MeshSimulator> logger)
     {
         _registry = registry;
         _archive = archive;
         _stream = stream;
+        _index = index;
         _logger = logger;
     }
 
@@ -68,6 +71,10 @@ public sealed class MeshSimulator : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         SeedMesh();
+
+        // The index mirrors the registry, so it has to be built once the
+        // devices exist.
+        _index.Rebuild();
 
         _logger.LogInformation(
             "Mesh simulator started with {Count} nodes.", _nodes.Count);
@@ -206,6 +213,8 @@ public sealed class MeshSimulator : BackgroundService
                         AlertType = "disconnect",
                         Message = "Node stopped publishing — no heartbeat."
                     });
+
+                    _index.RecordAlert(DateTimeOffset.UtcNow);
                 }
                 continue;
             }
@@ -242,6 +251,9 @@ public sealed class MeshSimulator : BackgroundService
 
             // Standard path: join the back of the FIFO queue.
             _stream.EnqueuePacket(packet);
+
+            // Timeline bucket for the dashboard graph.
+            _index.Record(packet);
 
             // Live scoring for the Pulse Grid, which also tells us whether
             // this reading warrants an alert.
@@ -283,7 +295,7 @@ public sealed class MeshSimulator : BackgroundService
 
         var direction = z > 0 ? "above" : "below";
 
-        _stream.RaiseAlert(new DeviceAlert
+        var queued = _stream.RaiseAlert(new DeviceAlert
         {
             DeviceId = node.Profile.Id,
             DeviceName = node.Profile.DisplayName,
@@ -294,6 +306,10 @@ public sealed class MeshSimulator : BackgroundService
             AlertType = alertType,
             Message = $"Reading {magnitude:0.0} deviations {direction} baseline."
         });
+
+        // Only record it on the timeline if it was actually queued, so a
+        // suppressed duplicate does not inflate the graph.
+        if (queued) _index.RecordAlert(DateTimeOffset.UtcNow);
     }
 
     private double NextValue(SimulatedNode node)

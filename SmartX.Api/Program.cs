@@ -10,6 +10,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<DeviceRegistry>();
 builder.Services.AddSingleton<TelemetryArchive>();
 builder.Services.AddSingleton<CommandStreamService>();
+builder.Services.AddSingleton<DeviceIndex>();
 builder.Services.AddScoped<TopologyBuilder>();
 builder.Services.AddHostedService<MeshSimulator>();
 
@@ -54,7 +55,8 @@ app.MapPost("/api/telemetry", (
     TelemetryPacketDto dto,
     DeviceRegistry registry,
     TelemetryArchive archive,
-    CommandStreamService stream) =>
+    CommandStreamService stream,
+    DeviceIndex index) =>
 {
     var errors = dto.Validate();
     if (errors.Count > 0)
@@ -74,6 +76,7 @@ app.MapPost("/api/telemetry", (
 
     archive.Ingest([packet], dto.Unit);
     stream.EnqueuePacket(packet);
+    index.Record(packet);
 
     return Results.Ok(new { dto.DeviceId, zScore = Math.Round(score.Value, 2) });
 })
@@ -85,7 +88,8 @@ app.MapPost("/api/telemetry/batch", (
     TelemetryPacketDto[] packets,
     DeviceRegistry registry,
     TelemetryArchive archive,
-    CommandStreamService stream) =>
+    CommandStreamService stream,
+    DeviceIndex index) =>
 {
     var accepted = new List<ITelemetryPacket>(packets.Length);
     var rejected = new List<string>();
@@ -107,6 +111,7 @@ app.MapPost("/api/telemetry/batch", (
 
         accepted.Add(packet);
         stream.EnqueuePacket(packet);
+        index.Record(packet);
     }
 
     // The whole accepted window is staged in one call, which is what the
@@ -137,7 +142,8 @@ app.MapGet("/api/devices/{id}", (string id, DeviceRegistry registry) =>
 .WithName("GetDevice")
 .WithSummary("Returns one sensor profile.");
 
-app.MapPost("/api/devices", (SensorProfile profile, DeviceRegistry registry) =>
+app.MapPost("/api/devices", (
+    SensorProfile profile, DeviceRegistry registry, DeviceIndex index) =>
 {
     // Validation runs here as well as in the browser, so the client is never
     // the only thing standing between bad data and the mesh.
@@ -145,6 +151,9 @@ app.MapPost("/api/devices", (SensorProfile profile, DeviceRegistry registry) =>
     {
         return Results.BadRequest(new { errors });
     }
+
+    // The lookup index mirrors the registry, so it must not drift from it.
+    index.Rebuild();
 
     return Results.Created($"/api/devices/{profile.Id}", profile);
 })
@@ -395,5 +404,62 @@ app.MapPost("/api/stream/simulate-alert", (
 })
 .WithName("SimulateAlert")
 .WithSummary("Raises a test alert, demonstrating priority ordering and dedupe.");
+
+// ------------------------------------------------------ lookup index
+// Counters for the MAC dictionary, the category index and the sorted
+// timeline, so the structures can be seen working rather than assumed.
+app.MapGet("/api/index/stats", (DeviceIndex index) =>
+    Results.Ok(index.Stats()))
+.WithName("GetIndexStats")
+.WithSummary("Lookup and timeline index counters.");
+
+// O(1) resolution of a MAC address to its device. The same question
+// answered by scanning the registry would be O(n) in the device count.
+app.MapGet("/api/index/by-mac/{mac}", (string mac, DeviceIndex index) =>
+{
+    var profile = index.ByMac(mac);
+    return profile is null
+        ? Results.NotFound(new { error = $"No device registered with MAC '{mac}'." })
+        : Results.Ok(profile);
+})
+.WithName("LookupByMac")
+.WithSummary("Resolves a MAC address to a device profile in constant time.");
+
+// Devices in one category, from the secondary index rather than a scan.
+app.MapGet("/api/index/by-category/{category}", (
+    SensorCategory category, DeviceIndex index, DeviceRegistry registry) =>
+{
+    var ids = index.ByCategory(category);
+
+    var profiles = ids
+        .Select(registry.GetProfile)
+        .Where(p => p is not null)
+        .ToList();
+
+    return Results.Ok(new { category, count = profiles.Count, devices = profiles });
+})
+.WithName("LookupByCategory")
+.WithSummary("Lists devices in a category using the secondary index.");
+
+// The timeline, already in chronological order because the structure keeps
+// it that way. Nothing is sorted at request time.
+app.MapGet("/api/index/timeline", (DeviceIndex index, int? take) =>
+    Results.Ok(index.Timeline(take ?? 120)))
+.WithName("GetTimeline")
+.WithSummary("Ordered packet and alert timeline for the dashboard graph.");
+
+app.MapGet("/api/index/timeline/range", (
+    DeviceIndex index, int fromSecondsAgo, int toSecondsAgo) =>
+{
+    var now = DateTimeOffset.UtcNow;
+    var from = now.AddSeconds(-Math.Abs(fromSecondsAgo));
+    var to = now.AddSeconds(-Math.Abs(toSecondsAgo));
+
+    return Results.Ok(index.Between(
+        from <= to ? from : to,
+        from <= to ? to : from));
+})
+.WithName("GetTimelineRange")
+.WithSummary("Range query over the sorted timeline.");
 
 app.Run();
